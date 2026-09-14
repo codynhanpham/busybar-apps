@@ -6,6 +6,7 @@ changes. Never resume a task, edit config.toml, or send a prompt as a fallback.
 from __future__ import annotations
 
 import copy
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import time
 import uuid
 
 from effort_animation import DURATION_S
+import codex_fast
 
 LEVELS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 STATE_KEYS = {'latestThreadSettings', 'latestModel', 'latestReasoningEffort',
@@ -224,8 +226,10 @@ class Controller:
         self.wake = threading.Event()
         self.thread_id = None
         self.state = {}
+        self.display_settings = {}
         self.revision = None
         self.pending = 0
+        self.pending_fast = deque()
         self.due = 0
         self.last_applied_at = 0
         self.pending_since = 0
@@ -244,12 +248,15 @@ class Controller:
         target = info['thread_id'] if 'thread_id' in info else self.target()
         return target, info, (target, info.get('kind'), info.get('socket'))
 
-    def status(self):
+    def status(self, display_thread_id=None):
         with self.lock:
             model, effort = model_effort(self.state)
             return {'enabled': True, 'connected': self.connected, 'thread_id': self.thread_id,
                     'kind': self.kind,
                     'model': model, 'effort': effort, 'error': self.error,
+                    'service_tier': codex_fast.current_tier(self.state),
+                    'fast': codex_fast.is_fast(self.state),
+                    'display': dict(self.display_settings.get(display_thread_id or self.thread_id, {})),
                     'direction': self.direction,
                     'confirmation_ms': self.confirmation_ms,
                     'display_ms': self.display_ms,
@@ -273,6 +280,19 @@ class Controller:
         self.wake.set()
         return True
 
+    def toggle_fast(self):
+        if not self.allowed():
+            return False
+        target, _, key = self.selection()
+        with self.lock:
+            if (not target or target != self.thread_id or not self.connected
+                    or (self.target_key is not None and key != self.target_key)
+                    or len(self.pending_fast) >= 8):
+                return False
+            self.pending_fast.append(time.monotonic())
+        self.wake.set()
+        return True
+
     def mark_drawn(self, revision):
         with self.lock:
             if revision == self.feedback_revision and self.feedback_input_at:
@@ -282,6 +302,18 @@ class Controller:
         with self.lock:
             self.state, self.revision = apply_change(self.state, self.revision, change)
             self.connected = True
+            model, effort = model_effort(self.state)
+            if self.thread_id and model and effort:
+                # Keep confirmed labels/speed visible after Cmd-H or focus loss.
+                # This bounded cache is never used to authorize a settings write.
+                self.display_settings.pop(self.thread_id, None)
+                self.display_settings[self.thread_id] = {
+                    'model': model, 'effort': effort,
+                    'service_tier': codex_fast.current_tier(self.state),
+                    'fast': codex_fast.is_fast(self.state),
+                }
+                if len(self.display_settings) > 16:
+                    self.display_settings.pop(next(iter(self.display_settings)))
         self.changed()
 
     def run(self, stop):
@@ -299,6 +331,7 @@ class Controller:
                         self.thread_id = target
                         self.target_key, self.kind = target_key, info.get('kind', 'desktop')
                         self.state, self.revision, self.pending = {}, None, 0
+                        self.pending_fast.clear()
                         self.connected, self.feedback, self.error = False, None, ''
                         self.confirmation_ms = self.display_ms = None
                         self.last_applied_at = self.feedback_input_at = 0
@@ -308,7 +341,8 @@ class Controller:
                     stop.wait(0.1)
                     continue
                 delta = 0
-                requested_effort = None
+                fast_at = None
+                requested = None
                 try:
                     if ipc is None:
                         with self.lock:
@@ -337,35 +371,55 @@ class Controller:
                         ipc.receive()
                     with self.lock:
                         delta = self.pending if time.monotonic() >= self.due else 0
-                        input_at = self.pending_since
+                        fast_at = (self.pending_fast.popleft() if self.pending_fast
+                                   and (not self.pending or self.pending_fast[0] < self.pending_since) else None)
+                        if fast_at is not None:
+                            delta = 0
+                        input_at = fast_at if fast_at is not None else self.pending_since
                         if delta:
                             self.pending = 0
                         state = copy.deepcopy(self.state)
-                    if not delta or self.selection()[2] != target_key or not self.allowed():
+                    if (not delta and fast_at is None) or self.selection()[2] != target_key or not self.allowed():
                         with self.lock:
                             wait = min(.05, max(0, self.due - time.monotonic())) if self.pending else .05
                         if not readable:
                             self.wake.wait(wait)
                         continue
                     model, current = model_effort(state)
-                    levels = (ipc.levels_for(model) if hasattr(ipc, 'levels_for')
-                              else self.catalog.levels_for(model))
-                    if current not in levels:
-                        raise CatalogError(f'Current effort={current!r} absent from catalog '
-                                           f'for model={model!r}; levels={levels}')
-                    effort = levels[max(0, min(len(levels) - 1, levels.index(current) + delta))]
-                    requested_effort = effort
-                    if effort != current:
+                    if fast_at is not None:
+                        try:
+                            settings, enabled = codex_fast.toggle_settings(state, self.home, self.kind)
+                        except (OSError, ValueError, KeyError, TypeError) as error:
+                            raise CatalogError(str(error)) from error
+                        requested = settings['serviceTier']
+                        feedback = 'FAST' if enabled else 'NORMAL'
+                        def confirmed():
+                            return (model_effort(self.state)[0] == model
+                                    and codex_fast.current_tier(self.state) == requested)
+                    else:
+                        levels = (ipc.levels_for(model) if hasattr(ipc, 'levels_for')
+                                  else self.catalog.levels_for(model))
+                        if current not in levels:
+                            raise CatalogError(f'Current effort={current!r} absent from catalog '
+                                               f'for model={model!r}; levels={levels}')
+                        requested = levels[max(0, min(len(levels) - 1, levels.index(current) + delta))]
+                        settings = effort_settings(state, requested)
+                        feedback = requested.upper()
+                        def confirmed():
+                            return model_effort(self.state) == (model, requested)
+                    if not confirmed():
                         ipc.request('thread-follower-update-thread-settings',
-                                    {'conversationId': target, 'threadSettings': effort_settings(state, effort)},
-                                    target=ipc.owner)
+                                    {'conversationId': target, 'threadSettings': settings}, target=ipc.owner)
                         deadline = time.monotonic() + 2
-                        while model_effort(self.state) != (model, effort) and time.monotonic() < deadline:
+                        while not confirmed() and time.monotonic() < deadline:
                             ipc.receive()
-                        if model_effort(self.state) != (model, effort):
-                            raise ValueError('Codex did not confirm effort change')
+                        if not confirmed():
+                            raise ValueError('Codex did not confirm settings change')
+                    # Focus may have moved while awaiting the owner's reply.
+                    if self.selection()[2] != target_key or not self.allowed():
+                        continue
                     with self.lock:
-                        self.feedback = effort.upper()
+                        self.feedback = feedback
                         self.feedback_revision += 1
                         self.direction = 1 if delta > 0 else -1
                         self.last_applied_at = time.monotonic()
@@ -376,7 +430,7 @@ class Controller:
                         if self.pending:
                             self.due = self.last_applied_at + STEP_INTERVAL_S
                         self.error = ''
-                    self.logger(f'Codex effort: {target} -> {effort}')
+                    self.logger(f'Codex settings: {target} -> {feedback}')
                     self.changed()
                 except CatalogError as error:
                     # Keep the valid subscription and any newly queued dial steps.
@@ -398,11 +452,12 @@ class Controller:
                         self.error = str(error)
                         self.connected = False
                         self.pending = 0
-                        self.feedback = 'ERR' if delta else None
+                        self.pending_fast.clear()
+                        self.feedback = 'ERR' if delta or fast_at is not None else None
                         self.feedback_revision += 1
                         self.feedback_until = time.monotonic() + 2.5
                     self.logger(f'Codex effort unavailable: kind={self.kind} thread={target} '
-                                f'requested={requested_effort} {error}')
+                                f'requested={requested} {error}')
                     self.changed()
                     retry_at = time.monotonic() + 3
         finally:

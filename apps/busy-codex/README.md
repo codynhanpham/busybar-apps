@@ -4,6 +4,12 @@ Codex task state, current account limits and elapsed quota-window
 progress on a BUSY Bar. Turn the dial to change the reasoning effort of the
 foreground Codex Desktop task or supported CLI session. The display reflects
 the confirmed setting; each effort level has its own native animation.
+Press the large START button to toggle Fast mode: gold warp ignition for Fast,
+blue deceleration for standard speed. Holding it does not repeat the toggle.
+Fast uses more plan allowance, just like enabling it inside Codex.
+
+After a task completes, DONE animates for five seconds and then becomes IDLE.
+Status and quota refreshes do not restart this timer.
 
 This is an independent community app, not an OpenAI or BUSY Bar product.
 
@@ -39,7 +45,7 @@ owned workers, releases its canvas and does not restart either process.
   change between Desktop releases.
 - **Codex CLI:** account limits can be read with stock CLI. Reliable effort
   switching and terminal session targeting require the
-  [native-control fork release](https://github.com/wowlocal/codex/releases/tag/v0.153.4-fork.1-native-control).
+  [native-control fork](https://github.com/wowlocal/codex/tree/codex/native-tui-control).
   It exposes a local, same-user Unix socket with versioned status and confirmed
   effort changes. No terminal keystroke injection or config-file rewriting is
   used. Foreground app/terminal selection is currently macOS-specific.
@@ -50,6 +56,10 @@ Session state is read from local Codex metadata. Account limits come from
 `account/rateLimits/read` through a short-lived local Codex app-server, refreshed
 once a minute. No model inference or prompt submission is performed. Missing
 or expired quota data remains unavailable instead of being shown as zero.
+
+Fast switching requires the fork's `fast/set` endpoint; restart CLI sessions
+after updating. The earlier `v0.153.4-fork.1-native-control` release supports
+effort only. The controls preserve Plan mode and do not write global defaults.
 
 ## Preview and conformance
 

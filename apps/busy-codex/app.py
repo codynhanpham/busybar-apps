@@ -7,9 +7,10 @@
 
 Download the complete app folder, not this entrypoint alone. Python 3.9+;
 standard library only. macOS foreground targeting follows Codex Desktop or
-the active CLI terminal. CLI effort control requires the native-control fork:
-https://github.com/wowlocal/codex/releases/tag/v0.153.4-fork.1-native-control
-Stock CLI remains usable for account limits, but cannot accept dial changes.
+the active CLI terminal. CLI controls require the native-control fork:
+https://github.com/wowlocal/codex/tree/codex/native-tui-control
+Fast needs a build with fast/set; restart CLI sessions after updating.
+Stock CLI remains usable for account limits, but cannot accept control changes.
 
 Reads local Codex session metadata and invokes the installed `codex app-server`
 only to read account limits. It does not send prompts, edit Codex config,
@@ -114,10 +115,11 @@ def demo(args):
     skipped rather than collected in a queue.
     """
     import effort_animation
+    import fast_animation
     from pixel_ui import encode_png
 
     bar = Bar(args.host)
-    levels = ("high", "xhigh", "max", "ultra")
+    levels = ("high", "ultra", "fast", "normal")
     started = time.monotonic()
     deadline = started + (args.seconds or float("inf"))
     retry_delay = .25
@@ -129,7 +131,8 @@ def demo(args):
             level = "ultra" if args.test else levels[int(elapsed / effort_animation.DURATION_S) % len(levels)]
             phase = elapsed % effort_animation.DURATION_S
             frame_index = 18 if args.test else int(phase * effort_animation.FPS)
-            pixels = effort_animation.frame(level, frame_index, entering=False)
+            pixels = (fast_animation.frame(level == "fast", frame_index, entering=False)
+                      if level in ("fast", "normal") else effort_animation.frame(level, frame_index, entering=False))
             name = f"demo-{index % 4}.png"
             index += 1
             try:

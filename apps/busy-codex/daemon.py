@@ -49,6 +49,7 @@ import codex_effort
 import codex_focus
 import codex_target
 import effort_animation
+import fast_animation
 from display_scene import DrawCache
 from busybar_http import HttpTransport, local_opener
 from busybar_input import InputStream, input_stream_url
@@ -170,7 +171,7 @@ TEXT_TIMEOUT_S = 15
 ANIM_TIMEOUT_S = 120
 ANIM_REFRESH_S = 60.0
 KEEPALIVE_S = 8.0
-COMPLETE_HOLD_S = 30.0
+COMPLETE_HOLD_S = 5.0
 # Idle release: after this many seconds of IDLE the screen is handed
 # back to the device (env BUSYBAR_IDLE_CLEAR_S; 0 = keep forever).
 IDLE_CLEAR_AFTER_S = float(os.environ.get("BUSYBAR_IDLE_CLEAR_S", "600"))
@@ -377,7 +378,10 @@ class Store:
                             new == "WORKING" and prev in ("IDLE", "COMPLETE")):
                         s["focus_ts"] = now
                     s["state"] = new
-                    s["state_ts"] = fields.get("state_ts", now)
+                    # Repeated snapshots are keepalives, not new completions.
+                    # Mirrors may supply the origin's actual transition time.
+                    if created or new != prev or "state_ts" in fields:
+                        s["state_ts"] = fields.get("state_ts", now)
                 if "focus_ts" in fields:
                     s["focus_ts"] = fields["focus_ts"]   # mirrored: the origin decided
                 for k in ("label", "label_color", "context_pct", "quotas", "quota_status",
@@ -429,6 +433,8 @@ DEVICE_MODE: str | None = None
 DEVICE_INPUT_CONNECTED = False
 DEVICE_INPUT_ERROR = ""
 LAST_ENCODER = {}
+LAST_START = {}
+START_DOWN = False
 EFFORT_CONTROLLER = None
 
 
@@ -737,7 +743,7 @@ ROLE = "standby" if STANDBY else "hub" if "0.0.0.0" in LISTEN_ADDRS else "local"
 
 def effective_state(sess: dict) -> str:
     state = sess["state"]
-    if state == "COMPLETE" and time.time() - sess["state_ts"] > COMPLETE_HOLD_S:
+    if state == "COMPLETE" and time.time() - sess["state_ts"] >= COMPLETE_HOLD_S:
         return "IDLE"
     return state
 
@@ -764,13 +770,19 @@ def status_snapshot() -> dict:
         if finite_number(observed_at):
             quota_status["age_s"] = max(0, round(now - observed_at, 1))
     label = sess.get("label")
+    badges = sess.get("badges")
     if EFFORT_CONTROLLER:
-        control = EFFORT_CONTROLLER.status()
-        if (control["connected"] and control["thread_id"] == sess.get("control_thread_id")
-                and control["model"] and control["effort"]):
+        control = EFFORT_CONTROLLER.status(display_thread_id=sess.get("control_thread_id"))
+        settings = (control if control.get("connected")
+                    and control.get("thread_id") == sess.get("control_thread_id")
+                    else control.get("display", {})) if sess.get("control_thread_id") else {}
+        if settings.get("model") and settings.get("effort"):
             from adapters.codex_status import prettify_model
-            label = shorten_model_label(prettify_model(control["model"]),
-                                        control["effort"], LABEL_MAX_PX)
+            label = shorten_model_label(prettify_model(settings["model"]),
+                                        settings["effort"], LABEL_MAX_PX)
+        if settings.get("fast") is not None:
+            badges = [badge for badge in badges or [] if badge not in ("fast", "priority")]
+            badges += ["fast"] if settings["fast"] else []
     return {
         "source": sess["source"],
         "state": effective_state(sess),
@@ -780,7 +792,7 @@ def status_snapshot() -> dict:
         "quotas": quotas or None,
         "quota_status": quota_status or None,
         "week_progress_pct": week_progress_pct(weekly_quota(quotas), now),
-        "badges": sess.get("badges"),
+        "badges": badges,
         "host": sess.get("host"),
         "host_tag": sess.get("host_tag"),
         "age_s": round(now - sess["last_active"], 1),
@@ -1114,8 +1126,8 @@ def device_canvas_allowed() -> bool:
 
 
 def handle_device_input_event(event: tuple) -> bool:
-    """Track the mode selector and route OK to an active Astra Watch app."""
-    global DEVICE_MODE, LAST_ENCODER
+    """Route START to Fast, the dial to effort, and OK to Astra Watch."""
+    global DEVICE_MODE, LAST_ENCODER, LAST_START, START_DOWN
     if not event:
         return False
     if event[0] == "encoder":
@@ -1133,6 +1145,27 @@ def handle_device_input_event(event: tuple) -> bool:
             log(f'Codex dial ignored: {reason}')
         return handled
     if event[0] == "button":
+        if len(event) >= 3 and event[1] == 2:  # START; PRESS=0, RELEASE=1
+            with DEVICE_INPUT_LOCK:
+                if event[2] == 1:
+                    START_DOWN = False
+                    return False
+                if event[2] != 0 or START_DOWN:
+                    return False
+                START_DOWN = True
+            handled = False
+            reason = ''
+            if EFFORT_CONTROLLER and effort_input_allowed():
+                handled = EFFORT_CONTROLLER.toggle_fast()
+                if not handled:
+                    reason = EFFORT_CONTROLLER.status().get('error') or 'Codex settings connection is not ready'
+            else:
+                reason = effort_input_block_reason() if EFFORT_CONTROLLER else 'Codex controls are disabled'
+            with DEVICE_INPUT_LOCK:
+                LAST_START = {'at': time.time(), 'handled': bool(handled), 'reason': reason}
+            if not handled:
+                log(f'Codex START ignored: {reason}')
+            return handled
         if event[1:3] == (0, 0) and astra_app_status()["active"]:
             request_astra_refresh()
             request_x_pulse_refresh(force=True)
@@ -1155,10 +1188,12 @@ def device_input_loop(input_url: str, stop: threading.Event,
                       source_address: str | None = None):
     """Observe hardware events through the shared buffered input stream."""
     def update_state(connected, error):
-        global DEVICE_INPUT_CONNECTED, DEVICE_INPUT_ERROR
+        global DEVICE_INPUT_CONNECTED, DEVICE_INPUT_ERROR, START_DOWN
         with DEVICE_INPUT_LOCK:
             DEVICE_INPUT_CONNECTED = connected
             DEVICE_INPUT_ERROR = error
+            if not connected:
+                START_DOWN = False
 
     InputStream(input_url, handle_device_input_event,
                 source_address=source_address, on_state=update_state,
@@ -1277,8 +1312,11 @@ def effort_feedback_elements(feedback):
 
 def effort_overlay_elements(feedback, direction=1, entering=True):
     error = feedback == "ERR"
-    path = (effort_animation.filename(feedback.lower(), direction, entering)
-            if feedback and not error else "effort_clear.anim")
+    if feedback in ('FAST', 'NORMAL'):
+        path = fast_animation.filename(feedback == 'FAST', entering)
+    else:
+        path = (effort_animation.filename(feedback.lower(), direction, entering)
+                if feedback and not error else "effort_clear.anim")
     return [
         {"id": "effort_transition", "type": "animation", "display": "front",
          "x": 0, "y": 0, "path": path, "loop": False, "timeout": 4, "z_index": 100},
@@ -1450,6 +1488,7 @@ class Handler(BaseHTTPRequestHandler):
                     "connected": DEVICE_INPUT_CONNECTED,
                     "error": DEVICE_INPUT_ERROR,
                     "last_encoder": LAST_ENCODER or None,
+                    "last_start": LAST_START or None,
                 },
                 "codex_effort": (EFFORT_CONTROLLER.status() if EFFORT_CONTROLLER
                                  else {"enabled": False}),
